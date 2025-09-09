@@ -16,7 +16,7 @@ def generate_launch_description():
                 output="screen",
                 parameters=[
                     {
-                        "port": "/dev/ttyUSB0",
+                        "port": "/dev/mwahrs",
                         "frame_id": "imu_link",
                         "version": "v2",
                     }
