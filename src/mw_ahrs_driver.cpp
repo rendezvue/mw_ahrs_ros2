@@ -14,171 +14,226 @@
 
 #include "mw_ahrs_ros2/mw_ahrs_driver.hpp"
 
-const char eol('\n');
-const size_t timeout(1000);
+constexpr char eol = '\n';
+constexpr size_t timeout = 1000;
+constexpr size_t data_size = 12;
 
-using namespace std::literals;
+MwAhrsDriver::MwAhrsDriver(const std::string& node) : Node(node)
+{
+  this->declare_parameter<std::string>("port", "/dev/ttyUSB0");
+  this->declare_parameter<std::string>("frame_id", "imu_link");
 
-MwAhrsDriver::MwAhrsDriver(const std::string& node) : Node(node) {
-    port_ = this->declare_parameter("port", "/dev/ttyUSB0");
-    frame_id_ = this->declare_parameter("frame_id", "imu_link");
-    version_ = this->declare_parameter("version", "v2");
+  this->get_parameter("port", port_);
+  this->get_parameter("frame_id", frame_id_);
 
-    srv_reset_ = this->create_service<std_srvs::srv::Trigger>(
-        "imu/reset", std::bind(&MwAhrsDriver::reset, this, std::placeholders::_1, std::placeholders::_2));
-    pub_imu_ = this->create_publisher<sensor_msgs::msg::Imu>("/imu/data", 1);
-    pub_rpy_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/imu/rpy", 1);
-    pub_mag_ = this->create_publisher<sensor_msgs::msg::MagneticField>("/imu/mag", 1);
+  srv_reset_ = this->create_service<std_srvs::srv::Trigger>(
+      "imu/reset", std::bind(&MwAhrsDriver::handle_reset, this, std::placeholders::_1, std::placeholders::_2));
+
+  pub_imu_ = this->create_publisher<sensor_msgs::msg::Imu>("/imu/data", 1);
+  pub_rpy_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/imu/rpy", 1);
+  pub_mag_ = this->create_publisher<sensor_msgs::msg::MagneticField>("/imu/mag", 1);
+
+  rp_imu_ = std::make_shared<realtime_tools::RealtimePublisher<sensor_msgs::msg::Imu>>(pub_imu_);
+  rp_imu_->msg_.header.frame_id = frame_id_;
+  rp_imu_->msg_.orientation_covariance = { 0.0025, 0, 0, 0, 0.0025, 0, 0, 0, 0.0025 };
+  rp_imu_->msg_.angular_velocity_covariance = { 0.02, 0, 0, 0, 0.02, 0, 0, 0, 0.02 };
+  rp_imu_->msg_.linear_acceleration_covariance = { 0.04, 0, 0, 0, 0.04, 0, 0, 0, 0.04 };
+
+  rp_rpy_ = std::make_shared<realtime_tools::RealtimePublisher<geometry_msgs::msg::Vector3Stamped>>(pub_rpy_);
+  rp_rpy_->msg_.header.frame_id = frame_id_;
+
+  rp_mag_ = std::make_shared<realtime_tools::RealtimePublisher<sensor_msgs::msg::MagneticField>>(pub_mag_);
+  rp_mag_->msg_.header.frame_id = frame_id_;
+
+  try
+  {
+    serial_.Open(port_);
+  }
+  catch (LibSerial::OpenFailed& e)
+  {
+    RCLCPP_ERROR(this->get_logger(), "Failed to open serial port [%s]: %s", port_.c_str(), e.what());
+    throw std::runtime_error("Failed to open serial port: " + port_);
+  }
+
+  serial_.SetBaudRate(LibSerial::BaudRate::BAUD_115200);
+  serial_.SetParity(LibSerial::Parity::PARITY_NONE);
+  serial_.SetStopBits(LibSerial::StopBits::STOP_BITS_1);
+  serial_.FlushIOBuffers();
+  rclcpp::sleep_for(std::chrono::milliseconds(100));
+
+  start_streaming();
+  running_.store(true);
+  thread_ = std::thread(&MwAhrsDriver::read_loop, this);
 }
 
-MwAhrsDriver::~MwAhrsDriver() {
-    serial_->Close();
+MwAhrsDriver::~MwAhrsDriver()
+{
+  running_.store(false);
+
+  if (thread_.joinable())
+    thread_.join();
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (serial_.IsOpen())
+    serial_.Close();
 }
 
-bool MwAhrsDriver::init() {
-    rp_imu_ = std::make_shared<realtime_tools::RealtimePublisher<sensor_msgs::msg::Imu>>(pub_imu_);
-    rp_imu_->msg_.header.frame_id = frame_id_;
-    rp_imu_->msg_.orientation_covariance = {0.0025, 0, 0, 0, 0.0025, 0, 0, 0, 0.0025};
-    rp_imu_->msg_.angular_velocity_covariance = {0.02, 0, 0, 0, 0.02, 0, 0, 0, 0.02};
-    rp_imu_->msg_.linear_acceleration_covariance = {0.04, 0, 0, 0, 0.04, 0, 0, 0, 0.04};
+void MwAhrsDriver::start_streaming()
+{
+  std::lock_guard<std::mutex> lock(mutex_);
 
-    rp_rpy_ = std::make_shared<realtime_tools::RealtimePublisher<geometry_msgs::msg::Vector3Stamped>>(pub_rpy_);
-    rp_rpy_->msg_.header.frame_id = frame_id_;
+  serial_.Write("ss=15\r\n");  // accel + gyro + angle + mag
+  serial_.Write("sp=40\r\n");  // 40ms
+}
 
-    rp_mag_ = std::make_shared<realtime_tools::RealtimePublisher<sensor_msgs::msg::MagneticField>>(pub_mag_);
-    rp_mag_->msg_.header.frame_id = frame_id_;
+void MwAhrsDriver::handle_reset(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+                                std::shared_ptr<std_srvs::srv::Trigger::Response> resp)
+{
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
 
-    // Initial setting for serial communication
-    serial_ = std::make_shared<LibSerial::SerialPort>();
-
-    try {
-        serial_->Open(port_);
-    } catch (LibSerial::OpenFailed& e) {
-        RCLCPP_ERROR_STREAM_ONCE(this->get_logger(), "LibSerial::OpenFailed: " << e.what());
-        return false;
+    if (!serial_.IsOpen())
+    {
+      resp->success = false;
+      resp->message = "Serial port is not open.";
+      return;
     }
 
-    serial_->SetBaudRate(LibSerial::BaudRate::BAUD_115200);
-    serial_->SetParity(LibSerial::Parity::PARITY_NONE);
-    serial_->SetStopBits(LibSerial::StopBits::STOP_BITS_1);
-    serial_->FlushIOBuffers();
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    serial_.Write("rst\r\n");
+  }
 
-    // Check the serial port
-    if (serial_->IsOpen()) {
-        RCLCPP_INFO(this->get_logger(), "MW AHRS driver connected to %s at %i baud", port_.c_str(), 115200);
-    } else {
-        RCLCPP_ERROR(this->get_logger(), "MW AHRS driver failed to connect to %s", port_.c_str());
-        return false;
+  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+  start_streaming();
+
+  resp->success = true;
+  resp->message = "Reset completed.";
+}
+
+void MwAhrsDriver::read_loop()
+{
+  while (running_.load() && rclcpp::ok())
+  {
+    std::string line;
+
+    try
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (serial_.IsOpen())
+      {
+        serial_.ReadLine(line, eol, timeout);
+      }
+      else
+      {
+        rclcpp::sleep_for(std::chrono::milliseconds(10));
+        continue;
+      }
+    }
+    catch (const std::exception& e)
+    {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Failed to read: %s", e.what());
+      continue;
     }
 
-    start();
+    if (line.empty())
+      continue;
 
-    publish_timer_ = this->create_wall_timer(10ms, std::bind(&MwAhrsDriver::publishData, this));
-    read_thread_ = std::make_shared<std::thread>(&MwAhrsDriver::read, this);
+    if (!line.empty() && line.back() == '\r')
+      line.pop_back();
 
-    return true;
-}
+    std::vector<double> data;
+    data.reserve(data_size);
 
-void MwAhrsDriver::read() {
-    while (rclcpp::ok()) {
-        if (serial_->IsDataAvailable()) {
-            std::string msg;
-            serial_->ReadLine(msg, eol, timeout);
+    std::istringstream iss(line);
+    double v = 0.0;
 
-            // Robust numeric extraction: collect all numbers in the line
-            std::vector<double> vals;
-            vals.reserve(32);
-            const char* p = msg.c_str();
-            while (*p) {
-                char* end = nullptr;
-                double v = std::strtod(p, &end);
-                if (end != p) {
-                    vals.push_back(v);
-                    p = end;
-                } else {
-                    ++p; // skip non-numeric char
-                }
-            }
-
-            // Expected order: [ax, ay, az, gx, gy, gz, roll, pitch, yaw, mx, my, mz, ...]
-            const size_t need = 12; // minimum needed values
-            if (vals.size() >= need) {
-                rp_rpy_->msg_.vector.x = vals[6] * M_PI / 180.0; // roll(rad)
-                rp_rpy_->msg_.vector.y = vals[7] * M_PI / 180.0; // pitch(rad)
-                rp_rpy_->msg_.vector.z = vals[8] * M_PI / 180.0; // yaw(rad)
-
-                rp_imu_->msg_.linear_acceleration.x = vals[0] * 9.80665;
-                rp_imu_->msg_.linear_acceleration.y = vals[1] * 9.80665;
-                rp_imu_->msg_.linear_acceleration.z = vals[2] * 9.80665;
-
-                rp_imu_->msg_.angular_velocity.x = vals[3] * M_PI / 180.0;
-                rp_imu_->msg_.angular_velocity.y = vals[4] * M_PI / 180.0;
-                rp_imu_->msg_.angular_velocity.z = vals[5] * M_PI / 180.0;
-
-                tf2::Quaternion quat;
-                quat.setRPY(rp_rpy_->msg_.vector.x, rp_rpy_->msg_.vector.y, rp_rpy_->msg_.vector.z);
-
-                rp_imu_->msg_.orientation.x = quat[0];
-                rp_imu_->msg_.orientation.y = quat[1];
-                rp_imu_->msg_.orientation.z = quat[2];
-                rp_imu_->msg_.orientation.w = quat[3];
-
-                // Magnetic field if available
-                if (vals.size() >= 15) {
-                    rp_mag_->msg_.magnetic_field.x = vals[9] * 0.000001;
-                    rp_mag_->msg_.magnetic_field.y = vals[10] * 0.000001;
-                    rp_mag_->msg_.magnetic_field.z = vals[11] * 0.000001;
-                }
-            }
-        }
+    while (iss >> v)
+    {
+      data.push_back(v);
+      if (data.size() >= data_size)
+        break;
     }
-}
 
-void MwAhrsDriver::start() {
-    std::string start = "ss=15\n";
-    serial_->Write(start);
+    if (data.size() < data_size)
+      continue;
 
-    std::string frequency = "sp=10\n";
-    serial_->Write(frequency);
-}
+    try
+    {
+      const double ax = data[0] * 9.80665;
+      const double ay = data[1] * 9.80665;
+      const double az = data[2] * 9.80665;
 
-void MwAhrsDriver::reset(const std::shared_ptr<std_srvs::srv::Trigger::Request>, std::shared_ptr<std_srvs::srv::Trigger::Response> resp) {
-    std::string msg = "rst\n";
-    serial_->Write(msg);
-    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-    start();
-    resp->success = true;
-}
+      const double gx = data[3] * M_PI / 180.0;
+      const double gy = data[4] * M_PI / 180.0;
+      const double gz = data[5] * M_PI / 180.0;
 
-void MwAhrsDriver::publishData() {
-    if (rp_rpy_->trylock()) {
-        rp_rpy_->msg_.header.stamp = this->now();
+      const double roll = data[6] * M_PI / 180.0;
+      const double pitch = data[7] * M_PI / 180.0;
+      const double yaw = data[8] * M_PI / 180.0;
+
+      tf2::Quaternion q;
+      q.setRPY(roll, pitch, yaw);
+
+      const double mx = data[9] * 1e-6;
+      const double my = data[10] * 1e-6;
+      const double mz = data[11] * 1e-6;
+
+      const auto stamp = this->now();
+
+      if (rp_rpy_ && rp_rpy_->trylock())
+      {
+        rp_rpy_->msg_.header.stamp = stamp;
+        rp_rpy_->msg_.vector.x = roll;
+        rp_rpy_->msg_.vector.y = pitch;
+        rp_rpy_->msg_.vector.z = yaw;
         rp_rpy_->unlockAndPublish();
-    }
+      }
 
-    if (rp_imu_->trylock()) {
-        rp_imu_->msg_.header.stamp = this->now();
+      if (rp_imu_ && rp_imu_->trylock())
+      {
+        rp_imu_->msg_.header.stamp = stamp;
+
+        rp_imu_->msg_.linear_acceleration.x = ax;
+        rp_imu_->msg_.linear_acceleration.y = ay;
+        rp_imu_->msg_.linear_acceleration.z = az;
+
+        rp_imu_->msg_.angular_velocity.x = gx;
+        rp_imu_->msg_.angular_velocity.y = gy;
+        rp_imu_->msg_.angular_velocity.z = gz;
+
+        rp_imu_->msg_.orientation.x = q.x();
+        rp_imu_->msg_.orientation.y = q.y();
+        rp_imu_->msg_.orientation.z = q.z();
+        rp_imu_->msg_.orientation.w = q.w();
+
         rp_imu_->unlockAndPublish();
-    }
+      }
 
-    if (rp_mag_->trylock()) {
-        rp_mag_->msg_.header.stamp = this->now();
+      if (rp_mag_ && rp_mag_->trylock())
+      {
+        rp_mag_->msg_.header.stamp = stamp;
+        rp_mag_->msg_.magnetic_field.x = mx;
+        rp_mag_->msg_.magnetic_field.y = my;
+        rp_mag_->msg_.magnetic_field.z = mz;
         rp_mag_->unlockAndPublish();
+      }
     }
+    catch (const std::exception& e)
+    {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Failed to parse: %s", e.what());
+      continue;
+    }
+  }
 }
 
-int main(int argc, char** argv) {
-    // Initialize ROS2 node
-    rclcpp::init(argc, argv);
-    auto node = std::make_shared<MwAhrsDriver>("mw_ahrs_driver_node");
+int main(int argc, char** argv)
+{
+  rclcpp::init(argc, argv);
+  auto node = std::make_shared<MwAhrsDriver>("mw_ahrs_driver_node");
+  auto executor = std::make_shared<rclcpp::executors::MultiThreadedExecutor>();
 
-    if (node->init()) {
-        auto executor = std::make_shared<rclcpp::executors::MultiThreadedExecutor>();
-        executor->add_node(node);
-        executor->spin();
-    }
+  executor->add_node(node);
+  executor->spin();
 
-    rclcpp::shutdown();
-    return 0;
+  rclcpp::shutdown();
+  return 0;
 }

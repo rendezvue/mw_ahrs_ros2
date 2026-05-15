@@ -14,6 +14,7 @@ def generate_launch_description():
                 executable="mw_ahrs_driver_node",
                 name="mw_ahrs_driver_node",
                 output="screen",
+                respawn=True,
                 parameters=[
                     {
                         "port": "/dev/mwahrs",
