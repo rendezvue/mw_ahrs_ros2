@@ -15,6 +15,7 @@ def generate_launch_description():
                 name="mw_ahrs_driver_node",
                 output="screen",
                 respawn=True,
+                respawn_delay=1.0,
                 parameters=[
                     {
                         "port": "/dev/mwahrs",

@@ -130,8 +130,9 @@ void MwAhrsDriver::read_loop()
     }
     catch (const std::exception& e)
     {
-      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Failed to read: %s", e.what());
-      continue;
+      RCLCPP_ERROR(this->get_logger(), "Failed to read: %s. Restarting node...", e.what());
+      rclcpp::shutdown();
+      return;
     }
 
     if (line.empty())
